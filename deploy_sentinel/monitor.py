@@ -1,4 +1,4 @@
-"""Deployment monitor — polls containers and triggers rollback on failures."""
+"""Core monitoring loop for deploy-sentinel."""
 
 from __future__ import annotations
 
@@ -7,110 +7,103 @@ import time
 from typing import List, Optional
 
 import docker
-from docker.models.containers import Container
 
 from deploy_sentinel.alert_policy import PolicyStore
-from deploy_sentinel.event_log import EventEntry, EventLog
+from deploy_sentinel.config import SentinelConfig
+from deploy_sentinel.container_filter import ContainerFilter, FilterConfig
 from deploy_sentinel.health_check import HealthChecker
 from deploy_sentinel.metrics import MetricsCollector
-from deploy_sentinel.notifier import DeployEvent, EventType, NotificationChannel
+from deploy_sentinel.notifier import DeployEvent, EventType
 from deploy_sentinel.rollback import RollbackManager
 from deploy_sentinel.snapshot import SnapshotStore
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
 class DeployMonitor:
-    """Continuously monitors Docker containers and reacts to health changes."""
+    """Polls Docker containers, checks health, and triggers rollbacks."""
 
     def __init__(
         self,
-        client: docker.DockerClient,
-        interval: int = 30,
-        enable_rollback: bool = True,
-        label_filter: Optional[List[str]] = None,
-        channels: Optional[List[NotificationChannel]] = None,
-        event_log: Optional[EventLog] = None,
+        config: SentinelConfig,
+        client=None,
+        notifier=None,
     ) -> None:
-        self._client = client
-        self.interval = interval
-        self.enable_rollback = enable_rollback
-        self.label_filter: List[str] = label_filter or []
-        self.channels: List[NotificationChannel] = channels or []
-        self.event_log = event_log or EventLog()
-        self._health_checker = HealthChecker(client)
-        self._rollback_manager = RollbackManager(client)
-        self._snapshot_store = SnapshotStore()
-        self._policy_store = PolicyStore()
+        self.config = config
+        self.client = client or docker.from_env()
+        self.notifier = notifier
+
+        filter_cfg = FilterConfig(
+            required_labels=config.required_labels,
+            name_patterns=config.name_patterns,
+            excluded_names=config.excluded_names,
+        )
+        self._filter = ContainerFilter(filter_cfg)
+        self._health = HealthChecker(self.client)
+        self._rollback = RollbackManager(self.client)
+        self._snapshots = SnapshotStore()
         self._metrics = MetricsCollector()
+        self._policies = PolicyStore()
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def run(self) -> None:  # pragma: no cover
-        """Block forever, polling containers on each interval."""
-        logger.info("DeployMonitor started (interval=%ds)", self.interval)
+        """Block forever, polling at the configured interval."""
+        log.info(
+            "deploy-sentinel started (interval=%ss, rollback=%s)",
+            self.config.check_interval,
+            not self.config.no_rollback,
+        )
         while True:
-            self.check_and_act()
-            time.sleep(self.interval)
+            try:
+                self.check_and_act()
+            except Exception:  # noqa: BLE001
+                log.exception("Unexpected error during check cycle")
+            time.sleep(self.config.check_interval)
 
     def check_and_act(self) -> None:
-        """Single monitoring pass across all relevant containers."""
+        """Single monitoring cycle: inspect containers and react."""
         containers = self._list_containers()
         for container in containers:
-            try:
-                self._process_container(container)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Error processing container %s: %s", container.name, exc)
+            self._process(container)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internals
     # ------------------------------------------------------------------
 
-    def _list_containers(self) -> List[Container]:
-        filters: dict = {"status": "running"}
-        if self.label_filter:
-            filters["label"] = self.label_filter
-        return self._client.containers.list(filters=filters)  # type: ignore[return-value]
+    def _list_containers(self) -> list:
+        all_containers = self.client.containers.list()
+        return self._filter.apply(all_containers)
 
-    def _process_container(self, container: Container) -> None:
-        health = self._health_checker.check(container)
-        policy = self._policy_store.get(container.name)
+    def _process(self, container) -> None:
+        cid = container.id
+        name = container.name
 
-        if not health.healthy:
-            self._metrics.record_health_failure(container.name)
+        health = self._health.check(container)
+        self._metrics.record_health_check(cid, name, health)
+
+        policy = self._policies.get(cid)
+        if not health.is_healthy:
             policy.record_failure()
-            self._log_event("health_failure", container, detail=health.detail)
-            logger.warning("Unhealthy: %s — %s", container.name, health.detail)
+            self._metrics.record_health_failure(cid, name)
+            log.warning("Container %s is unhealthy: %s", name, health.message)
 
-            if self.enable_rollback and not policy.is_valid():
-                self._do_rollback(container)
+            if not self.config.no_rollback and policy.should_alert():
+                self._trigger_rollback(container)
         else:
             policy.reset()
-            self._metrics.record_healthy(container.name)
 
-    def _do_rollback(self, container: Container) -> None:
-        logger.info("Initiating rollback for %s", container.name)
-        success = self._rollback_manager.rollback(container)
-        self._metrics.record_rollback(container.name, success=success)
-        self._log_event("rollback", container, detail="success" if success else "failed")
-        event = DeployEvent(
-            event_type=EventType.ROLLBACK,
-            container_name=container.name,
-            image=container.image.tags[0] if container.image.tags else "unknown",
-            success=success,
-        )
-        for ch in self.channels:
-            ch.send(event)
-
-    def _log_event(self, event_type: str, container: Container, detail: str = "") -> None:
-        image_tag = container.image.tags[0] if container.image.tags else "unknown"
-        entry = EventEntry.create(
-            event_type=event_type,
-            container_id=container.short_id,
-            container_name=container.name,
-            image=image_tag,
-            detail=detail,
-        )
-        self.event_log.append(entry)
+    def _trigger_rollback(self, container) -> None:
+        name = container.name
+        log.info("Initiating rollback for %s", name)
+        record = self._rollback.rollback(container)
+        self._metrics.record_rollback(container.id, name)
+        if self.notifier and record:
+            event = DeployEvent(
+                event_type=EventType.ROLLBACK,
+                container_name=name,
+                image=record.previous_image,
+            )
+            self.notifier.send(event)
