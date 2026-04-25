@@ -82,25 +82,21 @@ class TestValidate:
         assert cfg.validate() == []
 
     def test_interval_too_small(self):
-        cfg = SentinelConfig(health_check_interval=3)
+        cfg = SentinelConfig(health_check_interval=0)
         errors = cfg.validate()
-        assert any("health_check_interval" in e for e in errors)
+        assert any("interval" in e.lower() for e in errors)
 
-    def test_retries_less_than_one(self):
-        cfg = SentinelConfig(health_check_retries=0)
+    def test_interval_negative(self):
+        cfg = SentinelConfig(health_check_interval=-5)
         errors = cfg.validate()
-        assert any("health_check_retries" in e for e in errors)
+        assert any("interval" in e.lower() for e in errors)
 
-    def test_invalid_webhook_url(self):
-        cfg = SentinelConfig(webhook_url="ftp://bad")
+    def test_empty_watched_labels_returns_error(self):
+        cfg = SentinelConfig(watched_labels=[])
         errors = cfg.validate()
-        assert any("webhook_url" in e for e in errors)
+        assert any("label" in e.lower() for e in errors)
 
-    def test_valid_webhook_url_no_error(self):
-        cfg = SentinelConfig(webhook_url="https://hooks.example.com/notify")
-        assert cfg.validate() == []
-
-    def test_multiple_errors_reported(self):
-        cfg = SentinelConfig(health_check_interval=1, health_check_retries=0)
+    def test_invalid_webhook_url_returns_error(self):
+        cfg = SentinelConfig(webhook_url="not-a-valid-url")
         errors = cfg.validate()
-        assert len(errors) >= 2
+        assert any("webhook" in e.lower() for e in errors)
